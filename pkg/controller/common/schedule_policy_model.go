@@ -16,6 +16,12 @@ type SortPolicy struct {
 
 type FirstReplaceReplicasModel struct {
 	ResourceName string
-	TotalWeight int
+	TotalWeight  int
 	DiffReplicas int
+}
+
+type ReplicasModel struct {
+	Replicas      int
+	FillNum       int
+	AdditionalNum int
 }
