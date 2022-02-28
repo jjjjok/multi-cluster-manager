@@ -441,7 +441,8 @@ func (r *Reconciler) fillReplicas(positive bool, policyInstance v1alpha1.Schedul
 func (r *Reconciler) addReplicasByWeight(positive bool, policy *v1alpha1.MultiClusterResourceSchedulePolicy, sortPolicy *controllerCommon.SortPolicy, additionalNum int, bindingResourceCluster *v1alpha1.MultiClusterResourceBindingResource) error {
 	for additionalNum != 0 {
 		for j, policyInstance := range policy.Spec.Policy {
-			if positive {
+			switch positive {
+			case true:
 				policyMaxOrMin := policyInstance.Max
 				if policyInstance.Weight == sortPolicy.SortPolicyList[sortPolicy.SortPolicyListIndex].Weight && policyInstance.Name == sortPolicy.SortPolicyList[sortPolicy.SortPolicyListIndex].Name {
 					replicas, err := strconv.Atoi(bindingResourceCluster.Clusters[j].Override[0].Value)
@@ -463,7 +464,7 @@ func (r *Reconciler) addReplicasByWeight(positive bool, policy *v1alpha1.MultiCl
 						}
 					}
 				}
-			} else {
+			case false:
 				policyMaxOrMin := policyInstance.Min
 				if policyInstance.Weight == sortPolicy.SortPolicyList[sortPolicy.SortPolicyListIndex].Weight && policyInstance.Name == sortPolicy.SortPolicyList[sortPolicy.SortPolicyListIndex].Name {
 					replicas, err := strconv.Atoi(bindingResourceCluster.Clusters[j].Override[0].Value)
@@ -496,7 +497,8 @@ func (r *Reconciler) removeSortListByIndex(sortPolicy *controllerCommon.SortPoli
 		sortPolicy.SortPolicyListIndex = 0
 	}
 	if len(sortPolicy.SortPolicyList) == 0 {
-		return fmt.Errorf("calculate replicas failed")
+		return fmt.Errorf("calculate replicas failed: max or min not sets up correctly")
+
 	}
 	return nil
 }
@@ -618,18 +620,7 @@ func (r *Reconciler) replaceReplicasByClusterRole(ctx context.Context, policy *v
 		if err != nil {
 			return err
 		}
-		var policyInstance v1alpha1.SchedulePolicy
-		for _, cluster := range clusterSet.Spec.Clusters {
-			if cluster.Name == clusterName {
-				for _, instance := range policy.Spec.Policy {
-					if instance.Role == cluster.Role {
-						policyInstance = instance
-						break
-					}
-				}
-				break
-			}
-		}
+		policyInstance := r.getPolicyInstanceByClusterName(clusterSet, policy, clusterName)
 		replicasModel := &controllerCommon.ReplicasModel{Replicas: replicas, FillNum: fillNum, AdditionalNum: additionalNum}
 		additionalNum = r.fillReplicas(positive, policyInstance, replicasModel, &bindingResourceCluster.Clusters[j].Override[0])
 	}
@@ -640,6 +631,22 @@ func (r *Reconciler) replaceReplicasByClusterRole(ctx context.Context, policy *v
 
 	return nil
 }
+
+func (r *Reconciler) getPolicyInstanceByClusterName(clusterSet *v1alpha1.ClusterSet, policy *v1alpha1.MultiClusterResourceSchedulePolicy, clusterName string) v1alpha1.SchedulePolicy {
+	var policyInstance v1alpha1.SchedulePolicy
+	for _, cluster := range clusterSet.Spec.Clusters {
+		if cluster.Name == clusterName {
+			for _, instance := range policy.Spec.Policy {
+				if instance.Role == cluster.Role {
+					policyInstance = instance
+					return policyInstance
+				}
+			}
+		}
+	}
+	return policyInstance
+}
+
 func (r *Reconciler) addReplicasByClusterRole(positive bool, clusterSet *v1alpha1.ClusterSet, policy *v1alpha1.MultiClusterResourceSchedulePolicy, sortPolicy *controllerCommon.SortPolicy, additionalNum int, bindingResourceCluster *v1alpha1.MultiClusterResourceBindingResource) error {
 	for additionalNum != 0 {
 		if sortPolicy.SortPolicyListIndex == len(sortPolicy.SortPolicyList)-1 {
@@ -663,7 +670,8 @@ func (r *Reconciler) addReplicasByClusterRole(positive bool, clusterSet *v1alpha
 				if err != nil {
 					return err
 				}
-				if positive {
+				switch positive {
+				case true:
 					policyMaxOrMin := policyInstance.Max
 					if replicas < policyMaxOrMin {
 						bindingResourceCluster.Clusters[j].Override[0].Value = strconv.Itoa(replicas + 1)
@@ -671,7 +679,8 @@ func (r *Reconciler) addReplicasByClusterRole(positive bool, clusterSet *v1alpha
 					} else {
 						sortPolicy.SortPolicyList = append(sortPolicy.SortPolicyList[:sortPolicy.SortPolicyListIndex], sortPolicy.SortPolicyList[sortPolicy.SortPolicyListIndex+1:]...)
 						if len(sortPolicy.SortPolicyList) == 0 {
-							return fmt.Errorf("calculate replicas failed")
+							return fmt.Errorf("calculate replicas failed: max or min not sets up correctly")
+
 						}
 						if sortPolicy.SortPolicyListIndex == len(sortPolicy.SortPolicyList) {
 							sortPolicy.SortPolicyListIndex = -1
@@ -680,7 +689,7 @@ func (r *Reconciler) addReplicasByClusterRole(positive bool, clusterSet *v1alpha
 							continue
 						}
 					}
-				} else {
+				case false:
 					policyMaxOrMin := policyInstance.Min
 					if replicas > policyMaxOrMin {
 						bindingResourceCluster.Clusters[j].Override[0].Value = strconv.Itoa(replicas - 1)
@@ -688,7 +697,7 @@ func (r *Reconciler) addReplicasByClusterRole(positive bool, clusterSet *v1alpha
 					} else {
 						sortPolicy.SortPolicyList = append(sortPolicy.SortPolicyList[:sortPolicy.SortPolicyListIndex], sortPolicy.SortPolicyList[sortPolicy.SortPolicyListIndex+1:]...)
 						if len(sortPolicy.SortPolicyList) == 0 {
-							return fmt.Errorf("calculate replicas failed")
+							return fmt.Errorf("calculate replicas failed: max or min not sets up correctly")
 						}
 						if sortPolicy.SortPolicyListIndex == len(sortPolicy.SortPolicyList) {
 							sortPolicy.SortPolicyListIndex = -1
@@ -697,6 +706,7 @@ func (r *Reconciler) addReplicasByClusterRole(positive bool, clusterSet *v1alpha
 							continue
 						}
 					}
+
 				}
 			}
 		}
