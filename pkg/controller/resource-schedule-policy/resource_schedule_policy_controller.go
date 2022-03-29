@@ -303,15 +303,17 @@ func (r *Reconciler) generateBindingByWeighted(ctx context.Context, policy *v1al
 	totalWeight, diff := r.calculateWeight(policy)
 
 	for i, resourceInstance := range policy.Spec.Resources {
+
 		diffReplicas := diff
 		binding.Spec.Resources = append(binding.Spec.Resources, v1alpha1.MultiClusterResourceBindingResource{Name: resourceInstance.Name})
 		indexModel := controllerCommon.FailoverPolicyIndex{}
 		sortPolicy := r.doSortPolicyList(policy)
-		tempModel := &controllerCommon.FirstReplaceReplicasModel{
+		calculateModel := &controllerCommon.FirstReplaceReplicasModel{
 			ResourceName: resourceInstance.Name,
 			TotalWeight:  totalWeight,
 			DiffReplicas: diffReplicas,
 		}
+
 		for j, policyInstance := range policy.Spec.Policy {
 			if failIndex != nil {
 				if indexModel.DoneIndex < len(failIndex) && j == failIndex[indexModel.DoneIndex] {
@@ -325,8 +327,8 @@ func (r *Reconciler) generateBindingByWeighted(ctx context.Context, policy *v1al
 			} else {
 				binding.Spec.Resources[i].Clusters = append(binding.Spec.Resources[i].Clusters, v1alpha1.MultiClusterResourceBindingCluster{Name: policyInstance.Name})
 			}
-			// step1:replace replicas directly by weight
-			err := r.firstReplaceReplicasByWeight(ctx, policy, &binding.Spec.Resources[i].Clusters[j], &policyInstance, tempModel)
+			// replace replicas directly by weight
+			err := r.firstReplaceReplicasByWeight(ctx, policy, &binding.Spec.Resources[i].Clusters[j], &policyInstance, calculateModel)
 			if err != nil {
 				return nil, err
 			}
@@ -335,9 +337,9 @@ func (r *Reconciler) generateBindingByWeighted(ctx context.Context, policy *v1al
 				return nil, err
 			}
 		}
-		if tempModel.DiffReplicas != 0 {
-			// step2:assign replicas if total-replicas is not equal to policy.spec.replicas
-			err := r.replaceReplicasByWeight(policy, &binding.Spec.Resources[i], tempModel.DiffReplicas, sortPolicy)
+		if calculateModel.DiffReplicas != 0 {
+			// assign replicas if total-replicas is not equal to policy.spec.replicas
+			err := r.replaceReplicasByWeight(policy, &binding.Spec.Resources[i], calculateModel.DiffReplicas, sortPolicy)
 			if err != nil {
 				return nil, err
 			}
@@ -360,21 +362,12 @@ func (r *Reconciler) firstReplaceReplicasByWeight(ctx context.Context, policy *v
 	// replace replicas
 	if len(resource.Spec.ReplicasField) > 0 {
 		replicas := int((float64(policy.Spec.Replicas) / float64(model.TotalWeight)) * float64(policyInstance.Weight))
-		if replicas < policyInstance.Min {
-			model.DiffReplicas -= policyInstance.Min - replicas
-			replicas = policyInstance.Min
-
-		} else if replicas > policyInstance.Max {
-			model.DiffReplicas += replicas - policyInstance.Max
-			replicas = policyInstance.Max
-
+		if replicas == 0 {
+			replicas = 1
+			model.DiffReplicas -= 1
 		}
 
-		bindingResourceCluster.Override = append(bindingResourceCluster.Override, apicommon.JSONPatch{
-			Path:  resource.Spec.ReplicasField,
-			Op:    pkgcommon.BindingOpReplace,
-			Value: strconv.Itoa(replicas),
-		})
+		r.generalAddReplicas(resource.Spec.ReplicasField, pkgcommon.BindingOpReplace, strconv.Itoa(replicas), bindingResourceCluster)
 	}
 	return nil
 }
@@ -382,111 +375,47 @@ func (r *Reconciler) firstReplaceReplicasByWeight(ctx context.Context, policy *v
 // after the first-replace,if the total-replicas is not equal to policy.spec.replicas,will assign again according to the weight, until they are equal
 func (r *Reconciler) replaceReplicasByWeight(policy *v1alpha1.MultiClusterResourceSchedulePolicy, bindingResourceCluster *v1alpha1.MultiClusterResourceBindingResource, diffReplicas int, sortPolicy *controllerCommon.SortPolicy) error {
 	var (
-		fillNum       int
 		additionalNum int
-		positive      bool
 	)
-	switch {
-	// if calculated replicas<policy.spec.repicas
-	case diffReplicas > 0:
-		fillNum = diffReplicas / len(policy.Spec.Policy)
-		additionalNum = diffReplicas % len(policy.Spec.Policy)
-		positive = true
-	// if calculated replicas>policy.spec.repicas
-	case diffReplicas < 0:
-		fillNum = -diffReplicas / len(policy.Spec.Policy)
-		additionalNum = -diffReplicas % len(policy.Spec.Policy)
-		positive = false
-	}
 
-	for j, policyInstance := range policy.Spec.Policy {
-		replicas, err := strconv.Atoi(bindingResourceCluster.Clusters[j].Override[0].Value)
-		if err != nil {
-			return err
-		}
-		replicasModel := &controllerCommon.ReplicasModel{Replicas: replicas, FillNum: fillNum, AdditionalNum: additionalNum}
-		additionalNum = r.fillReplicas(positive, policyInstance, replicasModel, &bindingResourceCluster.Clusters[j].Override[0])
-	}
-	err := r.addReplicasByWeight(positive, policy, sortPolicy, additionalNum, bindingResourceCluster)
+	additionalNum = diffReplicas % len(policy.Spec.Policy)
+
+	err := r.addReplicasByWeight(policy, sortPolicy, additionalNum, bindingResourceCluster)
 	if err != nil {
 		return err
 	}
 
 	return nil
 }
-func (r *Reconciler) fillReplicas(positive bool, policyInstance v1alpha1.SchedulePolicy, replicasModel *controllerCommon.ReplicasModel, override *apicommon.JSONPatch) int {
-	if positive {
-		policyMaxOrMin := policyInstance.Max
-		toMaxOrMin := policyMaxOrMin - replicasModel.Replicas
 
-		if toMaxOrMin < replicasModel.FillNum {
-			override.Value = strconv.Itoa(policyMaxOrMin)
-			replicasModel.AdditionalNum += replicasModel.FillNum - toMaxOrMin
-		} else {
-			override.Value = strconv.Itoa(replicasModel.Replicas + replicasModel.FillNum)
-		}
-	} else {
-		policyMaxOrMin := policyInstance.Min
-		toMaxOrMin := replicasModel.Replicas - policyMaxOrMin
-		if toMaxOrMin < replicasModel.FillNum {
-			override.Value = strconv.Itoa(policyMaxOrMin)
-			replicasModel.AdditionalNum += replicasModel.FillNum - toMaxOrMin
-		} else {
-			override.Value = strconv.Itoa(replicasModel.Replicas - replicasModel.FillNum)
-		}
-	}
-	return replicasModel.AdditionalNum
-}
-
-func (r *Reconciler) addReplicasByWeight(positive bool, policy *v1alpha1.MultiClusterResourceSchedulePolicy, sortPolicy *controllerCommon.SortPolicy, additionalNum int, bindingResourceCluster *v1alpha1.MultiClusterResourceBindingResource) error {
+func (r *Reconciler) addReplicasByWeight(policy *v1alpha1.MultiClusterResourceSchedulePolicy, sortPolicy *controllerCommon.SortPolicy, additionalNum int, bindingResourceCluster *v1alpha1.MultiClusterResourceBindingResource) error {
 	for additionalNum != 0 {
 		for j, policyInstance := range policy.Spec.Policy {
-			switch positive {
-			case true:
-				policyMaxOrMin := policyInstance.Max
-				if policyInstance.Weight == sortPolicy.SortPolicyList[sortPolicy.SortPolicyListIndex].Weight && policyInstance.Name == sortPolicy.SortPolicyList[sortPolicy.SortPolicyListIndex].Name {
-					replicas, err := strconv.Atoi(bindingResourceCluster.Clusters[j].Override[0].Value)
-					if err != nil {
-						return err
-					}
-					if replicas < policyMaxOrMin {
-						bindingResourceCluster.Clusters[j].Override[0].Value = strconv.Itoa(replicas + 1)
-						additionalNum = additionalNum - 1
-						if sortPolicy.SortPolicyListIndex == len(sortPolicy.SortPolicyList)-1 {
-							sortPolicy.SortPolicyListIndex = 0
-						} else {
-							sortPolicy.SortPolicyListIndex = sortPolicy.SortPolicyListIndex + 1
-						}
-					} else {
-						err = r.removeSortListByIndex(sortPolicy)
-						if err != nil {
-							return err
-						}
-					}
+			policyMax := policyInstance.Max
+			// 如果权重最高，分配额外的replicas
+			if policyInstance.Weight == sortPolicy.SortPolicyList[sortPolicy.SortPolicyListIndex].Weight && policyInstance.Name == sortPolicy.SortPolicyList[sortPolicy.SortPolicyListIndex].Name {
+				replicas, err := strconv.Atoi(bindingResourceCluster.Clusters[j].Override[0].Value)
+				if err != nil {
+					return err
 				}
-			case false:
-				policyMaxOrMin := policyInstance.Min
-				if policyInstance.Weight == sortPolicy.SortPolicyList[sortPolicy.SortPolicyListIndex].Weight && policyInstance.Name == sortPolicy.SortPolicyList[sortPolicy.SortPolicyListIndex].Name {
-					replicas, err := strconv.Atoi(bindingResourceCluster.Clusters[j].Override[0].Value)
+				if replicas < policyMax {
+					bindingResourceCluster.Clusters[j].Override[0].Value = strconv.Itoa(replicas + 1)
+					additionalNum = additionalNum - 1
+					// 如果到了尾部，则重置
+					if sortPolicy.SortPolicyListIndex == len(sortPolicy.SortPolicyList)-1 {
+						sortPolicy.SortPolicyListIndex = 0
+					} else {
+						sortPolicy.SortPolicyListIndex = sortPolicy.SortPolicyListIndex + 1
+					}
+				} else {
+					// 如果达到了设定的max，将其从排序列表中删除
+					err = r.removeSortListByIndex(sortPolicy)
 					if err != nil {
 						return err
-					}
-					if replicas > policyMaxOrMin {
-						bindingResourceCluster.Clusters[j].Override[0].Value = strconv.Itoa(replicas - 1)
-						additionalNum = additionalNum - 1
-						if sortPolicy.SortPolicyListIndex == len(sortPolicy.SortPolicyList)-1 {
-							sortPolicy.SortPolicyListIndex = 0
-						} else {
-							sortPolicy.SortPolicyListIndex = sortPolicy.SortPolicyListIndex + 1
-						}
-					} else {
-						err = r.removeSortListByIndex(sortPolicy)
-						if err != nil {
-							return err
-						}
 					}
 				}
 			}
+
 		}
 	}
 	return nil
@@ -498,7 +427,6 @@ func (r *Reconciler) removeSortListByIndex(sortPolicy *controllerCommon.SortPoli
 	}
 	if len(sortPolicy.SortPolicyList) == 0 {
 		return fmt.Errorf("calculate replicas failed: max or min not sets up correctly")
-
 	}
 	return nil
 }
@@ -512,7 +440,7 @@ func (r *Reconciler) generateBindingByClusterRole(ctx context.Context, policy *v
 		binding.Spec.Resources = append(binding.Spec.Resources, v1alpha1.MultiClusterResourceBindingResource{Name: resourceInstance.Name})
 		indexModel := controllerCommon.FailoverPolicyIndex{}
 		sortPolicy := r.doSortPolicyList(policy)
-		tempModel := &controllerCommon.FirstReplaceReplicasModel{
+		calculateModel := &controllerCommon.FirstReplaceReplicasModel{
 			ResourceName: resourceInstance.Name,
 			TotalWeight:  totalWeight,
 			DiffReplicas: diffReplicas,
@@ -531,7 +459,7 @@ func (r *Reconciler) generateBindingByClusterRole(ctx context.Context, policy *v
 				binding.Spec.Resources[i].Clusters = append(binding.Spec.Resources[i].Clusters, v1alpha1.MultiClusterResourceBindingCluster{Name: clusterName})
 			}
 
-			err := r.firstReplaceReplicasByClusterRole(ctx, policy, &binding.Spec.Resources[i].Clusters[j], tempModel, clusterSet, clusterName)
+			err := r.firstReplaceReplicasByClusterRole(ctx, policy, &binding.Spec.Resources[i].Clusters[j], calculateModel, clusterSet, clusterName)
 			if err != nil {
 				return nil, err
 			}
@@ -540,8 +468,8 @@ func (r *Reconciler) generateBindingByClusterRole(ctx context.Context, policy *v
 				return nil, err
 			}
 		}
-		if tempModel.DiffReplicas != 0 {
-			err := r.replaceReplicasByClusterRole(ctx, policy, &binding.Spec.Resources[i], tempModel.DiffReplicas, sortPolicy, clusterSet)
+		if calculateModel.DiffReplicas != 0 {
+			err := r.replaceReplicasByClusterRole(ctx, policy, &binding.Spec.Resources[i], calculateModel.DiffReplicas, sortPolicy, clusterSet)
 			if err != nil {
 				return nil, err
 			}
@@ -562,69 +490,34 @@ func (r *Reconciler) firstReplaceReplicasByClusterRole(ctx context.Context, poli
 	}
 	if len(resource.Spec.ReplicasField) > 0 {
 		var replicas int
-		var policyInstance v1alpha1.SchedulePolicy
 		for _, cluster := range clusterSet.Spec.Clusters {
 			if cluster.Name == clusterName {
 				for _, instance := range policy.Spec.Policy {
 					if instance.Role == cluster.Role {
 						replicas = int((float64(policy.Spec.Replicas) / float64(model.TotalWeight)) * float64(instance.Weight))
-
-						policyInstance = instance
 						break
 					}
 				}
 				break
 			}
 		}
-		if replicas < policyInstance.Min {
-			model.DiffReplicas -= policyInstance.Min - replicas
-			replicas = policyInstance.Min
-
+		if replicas == 0 {
+			model.DiffReplicas -= 1
+			replicas = 1
 		}
-		if replicas > policyInstance.Max {
-			model.DiffReplicas += replicas - policyInstance.Max
-			replicas = policyInstance.Max
-
-		}
-
-		bindingResourceCluster.Override = append(bindingResourceCluster.Override, apicommon.JSONPatch{
-			Path:  resource.Spec.ReplicasField,
-			Op:    pkgcommon.BindingOpReplace,
-			Value: strconv.Itoa(replicas),
-		})
+		r.generalAddReplicas(resource.Spec.ReplicasField, pkgcommon.BindingOpReplace, strconv.Itoa(replicas), bindingResourceCluster)
 	}
 	return nil
 }
 
 func (r *Reconciler) replaceReplicasByClusterRole(ctx context.Context, policy *v1alpha1.MultiClusterResourceSchedulePolicy, bindingResourceCluster *v1alpha1.MultiClusterResourceBindingResource, diffReplicas int, sortPolicy *controllerCommon.SortPolicy, clusterSet *v1alpha1.ClusterSet) error {
 	clusterList := r.getClusterListByClusterSet(ctx, clusterSet)
-	sortPolicy.SortPolicyListIndex = -1
+	sortPolicy.SortPolicyListIndex = 0
 	var (
-		fillNum       int
 		additionalNum int
-		positive      bool
 	)
-	switch {
-	case diffReplicas > 0:
-		fillNum = diffReplicas / len(clusterList)
-		additionalNum = diffReplicas % len(clusterList)
-		positive = true
-	case diffReplicas < 0:
-		fillNum = -(diffReplicas / len(clusterList))
-		additionalNum = -(diffReplicas % len(clusterList))
-		positive = false
-	}
-
-	for j, clusterName := range clusterList {
-		replicas, err := strconv.Atoi(bindingResourceCluster.Clusters[j].Override[0].Value)
-		if err != nil {
-			return err
-		}
-		policyInstance := r.getPolicyInstanceByClusterName(clusterSet, policy, clusterName)
-		replicasModel := &controllerCommon.ReplicasModel{Replicas: replicas, FillNum: fillNum, AdditionalNum: additionalNum}
-		additionalNum = r.fillReplicas(positive, policyInstance, replicasModel, &bindingResourceCluster.Clusters[j].Override[0])
-	}
-	err := r.addReplicasByClusterRole(positive, clusterSet, policy, sortPolicy, additionalNum, bindingResourceCluster)
+	additionalNum = diffReplicas % len(clusterList)
+	err := r.addReplicasByClusterRole(clusterSet, policy, sortPolicy, additionalNum, bindingResourceCluster)
 	if err != nil {
 		return err
 	}
@@ -647,66 +540,42 @@ func (r *Reconciler) getPolicyInstanceByClusterName(clusterSet *v1alpha1.Cluster
 	return policyInstance
 }
 
-func (r *Reconciler) addReplicasByClusterRole(positive bool, clusterSet *v1alpha1.ClusterSet, policy *v1alpha1.MultiClusterResourceSchedulePolicy, sortPolicy *controllerCommon.SortPolicy, additionalNum int, bindingResourceCluster *v1alpha1.MultiClusterResourceBindingResource) error {
+func (r *Reconciler) addReplicasByClusterRole(clusterSet *v1alpha1.ClusterSet, policy *v1alpha1.MultiClusterResourceSchedulePolicy, sortPolicy *controllerCommon.SortPolicy, additionalNum int, bindingResourceCluster *v1alpha1.MultiClusterResourceBindingResource) error {
+	var doFirst = 0
 	for additionalNum != 0 {
-		if sortPolicy.SortPolicyListIndex == len(sortPolicy.SortPolicyList)-1 {
-			sortPolicy.SortPolicyListIndex = 0
+		// 不是第一轮循环，说明权重最大的情况已经完成处理，可以将其删除
+		if doFirst != 0 {
+			sortPolicy.SortPolicyList = sortPolicy.SortPolicyList[1:]
+			// 删除后排序列表为空，说明配置出错
+			if len(sortPolicy.SortPolicyList) == 0 {
+				return fmt.Errorf("calculate replicas failed: max or min not sets up correctly")
+			}
 		} else {
-			sortPolicy.SortPolicyListIndex += 1
+			doFirst = 1
 		}
+		// 每轮循环将处理clusterset中与权重排序列表中最大值相对应的cluster
 		for j, cluster := range clusterSet.Spec.Clusters {
 			if additionalNum == 0 {
 				break
 			}
 			var policyInstance v1alpha1.SchedulePolicy
+
 			for _, instance := range policy.Spec.Policy {
 				if instance.Role == cluster.Role {
 					policyInstance = instance
 					break
 				}
 			}
+			// 如果与权重最高的cluster.role相等，则分配
 			if policyInstance.Role == sortPolicy.SortPolicyList[sortPolicy.SortPolicyListIndex].Role {
 				replicas, err := strconv.Atoi(bindingResourceCluster.Clusters[j].Override[0].Value)
 				if err != nil {
 					return err
 				}
-				switch positive {
-				case true:
-					policyMaxOrMin := policyInstance.Max
-					if replicas < policyMaxOrMin {
-						bindingResourceCluster.Clusters[j].Override[0].Value = strconv.Itoa(replicas + 1)
-						additionalNum = additionalNum - 1
-					} else {
-						sortPolicy.SortPolicyList = append(sortPolicy.SortPolicyList[:sortPolicy.SortPolicyListIndex], sortPolicy.SortPolicyList[sortPolicy.SortPolicyListIndex+1:]...)
-						if len(sortPolicy.SortPolicyList) == 0 {
-							return fmt.Errorf("calculate replicas failed: max or min not sets up correctly")
-
-						}
-						if sortPolicy.SortPolicyListIndex == len(sortPolicy.SortPolicyList) {
-							sortPolicy.SortPolicyListIndex = -1
-							break
-						} else {
-							continue
-						}
-					}
-				case false:
-					policyMaxOrMin := policyInstance.Min
-					if replicas > policyMaxOrMin {
-						bindingResourceCluster.Clusters[j].Override[0].Value = strconv.Itoa(replicas - 1)
-						additionalNum = additionalNum - 1
-					} else {
-						sortPolicy.SortPolicyList = append(sortPolicy.SortPolicyList[:sortPolicy.SortPolicyListIndex], sortPolicy.SortPolicyList[sortPolicy.SortPolicyListIndex+1:]...)
-						if len(sortPolicy.SortPolicyList) == 0 {
-							return fmt.Errorf("calculate replicas failed: max or min not sets up correctly")
-						}
-						if sortPolicy.SortPolicyListIndex == len(sortPolicy.SortPolicyList) {
-							sortPolicy.SortPolicyListIndex = -1
-							break
-						} else {
-							continue
-						}
-					}
-
+				policyMax := policyInstance.Max
+				if replicas < policyMax {
+					bindingResourceCluster.Clusters[j].Override[0].Value = strconv.Itoa(replicas + 1)
+					additionalNum = additionalNum - 1
 				}
 			}
 		}
@@ -831,12 +700,8 @@ func (r *Reconciler) replaceResourceReplicasField(ctx context.Context, policy *v
 		return err
 	}
 	if len(resource.Spec.ReplicasField) > 0 {
-		bindingResourceCluster.Override = append(bindingResourceCluster.Override, apicommon.JSONPatch{
-			Path:  resource.Spec.ReplicasField,
-			Op:    pkgcommon.BindingOpReplace,
-			Value: strconv.Itoa(policy.Spec.Replicas),
-		})
 
+		r.generalAddReplicas(resource.Spec.ReplicasField, pkgcommon.BindingOpReplace, strconv.Itoa(policy.Spec.Replicas), bindingResourceCluster)
 	}
 	return nil
 }
@@ -1031,6 +896,14 @@ func (r *Reconciler) doSortPolicyList(policy *v1alpha1.MultiClusterResourceSched
 	sortPolicyListIndex := 0
 	sortPolicy := &controllerCommon.SortPolicy{SortPolicyList: sortPolicyList, SortPolicyListIndex: sortPolicyListIndex}
 	return sortPolicy
+}
+
+func (r *Reconciler) generalAddReplicas(path, op, value string, bindingResourceCluster *v1alpha1.MultiClusterResourceBindingCluster) {
+	bindingResourceCluster.Override = append(bindingResourceCluster.Override, apicommon.JSONPatch{
+		Path:  path,
+		Op:    op,
+		Value: value,
+	})
 }
 
 func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {

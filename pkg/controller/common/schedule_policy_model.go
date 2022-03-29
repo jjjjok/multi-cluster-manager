@@ -19,9 +19,3 @@ type FirstReplaceReplicasModel struct {
 	TotalWeight  int
 	DiffReplicas int
 }
-
-type ReplicasModel struct {
-	Replicas      int
-	FillNum       int
-	AdditionalNum int
-}
